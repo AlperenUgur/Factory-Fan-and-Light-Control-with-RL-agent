@@ -4,10 +4,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import imageio.v2 as imageio
 
-# =======================
-# 1) 4 ODANIN KONUMU
-# =======================
-
 ROOM_POSITIONS = [
     (1, 1),  # Oda 1
     (1, 4),  # Oda 2
@@ -15,13 +11,7 @@ ROOM_POSITIONS = [
     (4, 4),  # Oda 4
 ]
 
-# İlk iki oda "sürekli ısınan" oda olsun (fan yoksa ısı yükseliyor)
 HOT_ROOM_FLAGS = [True, True, False, False]
-
-
-# ============================================
-# 2) Tek Oda İçin RL Ortamı
-# ============================================
 
 class FactoryRoomEnv:
     """
@@ -40,7 +30,7 @@ class FactoryRoomEnv:
     def __init__(self, hot_room=False):
         self.n_actions = 6
         self.state = None
-        self.hot_room = hot_room  # 🔥 bu oda ısınan oda mı?
+        self.hot_room = hot_room  
 
     def reset(self):
         self.state = (
@@ -70,12 +60,12 @@ class FactoryRoomEnv:
         # === ÖDÜL FONKSİYONU ===
         if activity == 1:
             if light_on:
-                reward += 3   # aktifken ışık açık
+                reward += 3   
             if temp == 2 and fan_level > 0:
-                reward += 3   # sıcak ortamda fan konfor sağlıyor
+                reward += 3   
         else:
             if light_on or fan_level > 0:
-                reward -= 3   # boşken açık bırakırsan ceza
+                reward -= 3   
 
         # Pahalı saatte gereksiz kapalı kalabilirse bonus
         if price == 1 and activity == 0 and light_on == 0 and fan_level == 0:
@@ -91,9 +81,9 @@ class FactoryRoomEnv:
             power += 3.0
 
         cost = power * (1 if price == 0 else 2)  # pahalıysa ×2
-        reward -= cost * 0.4  # biraz daha yumuşattım (0.5→0.4)
+        reward -= cost * 0.4  
 
-        # === SICAKLIK GÜNCELLEMESİ ===
+        
         new_temp = temp
 
         # Fan çalışıyorsa soğutma etkisi
@@ -109,23 +99,17 @@ class FactoryRoomEnv:
         # Fan kapalıysa ortamın pasif davranışı
         if fan_level == 0:
             if self.hot_room:
-                # 🔥 Sıcak oda: fan yoksa sürekli ısınmaya meyilli
                 if new_temp < 2 and random.random() < 0.8:
                     new_temp += 1
             else:
-                # Normal oda: gündüz hafif ısınma, gece hafif soğuma
                 if hour == 0 and new_temp < 2 and random.random() < 0.4:
                     new_temp += 1
                 elif hour == 1 and new_temp > 0 and random.random() < 0.4:
                     new_temp -= 1
-
-        # === SAAT & FİYAT GÜNCELLEMESİ ===
-        # Saat değişimi
         if random.random() < 0.1:
             hour = 1 - hour
 
-        # Saat -> fiyat
-        price = 1 if hour == 0 else 0  # gündüz pahalı, gece ucuz
+        price = 1 if hour == 0 else 0  
 
         # Aktivite değişimi
         if random.random() < 0.3:
@@ -136,17 +120,12 @@ class FactoryRoomEnv:
         return self.state, reward, False, info
 
 
-# ===============================
-# 3) Q Learning
-# ===============================
-
 def state_to_index(state):
     a, t, h, p = state
-    # 2 * 3 * 2 * 2 = 24
     return a * 12 + t * 4 + h * 2 + p
 
 
-def train_room(n_episodes=2000, max_steps=40, hot_room=False):
+def train_room(n_episodes=200, max_steps=40, hot_room=False):
     env = FactoryRoomEnv(hot_room=hot_room)
     Q = np.zeros((24, 6))
 
@@ -179,11 +158,6 @@ def train_room(n_episodes=2000, max_steps=40, hot_room=False):
 
     return Q, temp_hist, cost_hist
 
-
-# ===============================
-# 4) Renkler
-# ===============================
-
 def action_to_color(action):
     mapping = {
         0: 0,  # kapalı
@@ -202,11 +176,6 @@ cmap = ListedColormap([
     "#000080",  # 2 lacivert
     "#1E90FF",  # 3 mavi
 ])
-
-
-# ===============================
-# 5) Fabrika GIF (4 odalı)
-# ===============================
 
 def create_factory_gif(Q_rooms, hot_flags, filename="factory.gif", frames=50):
     # Her oda için kendi ortamını başlat (aynı hot_room parametresi ile)
@@ -242,11 +211,6 @@ def create_factory_gif(Q_rooms, hot_flags, filename="factory.gif", frames=50):
     imageio.mimsave(filename, imgs, fps=4)
     print("GIF kaydedildi:", filename)
 
-
-# ===============================
-# 6) PNG çıktı
-# ===============================
-
 def save_graphs(temp, cost,
                 temp_file="temperature.png",
                 energy_file="energy.png"):
@@ -271,11 +235,6 @@ def save_graphs(temp, cost,
 
     print(f"PNG dosyaları kaydedildi: {temp_file}, {energy_file}")
 
-
-# ===============================
-# MAIN
-# ===============================
-
 if __name__ == "__main__":
     Q_rooms = []
     temp_last = []
@@ -286,7 +245,7 @@ if __name__ == "__main__":
         hot = HOT_ROOM_FLAGS[i]
         print(f"Oda {i+1} eğitiliyor... (hot_room={hot})")
         Q, temp, cost = train_room(
-            n_episodes=800,   # istersen artır (örneğin 1500)
+            n_episodes=1500,   
             max_steps=40,
             hot_room=hot
         )
