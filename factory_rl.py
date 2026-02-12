@@ -1,257 +1,491 @@
-import numpy as np
 import random
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import imageio.v2 as imageio
 
-ROOM_POSITIONS = [
-    (1, 1),  # Oda 1
-    (1, 4),  # Oda 2
-    (4, 1),  # Oda 3
-    (4, 4),  # Oda 4
-]
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
-HOT_ROOM_FLAGS = [True, True, False, False]
+# ==========================
+# SABİT AYARLAR
+# ==========================
+
+ROOM_POSITIONS = [(1, 1), (1, 4), (4, 1), (4, 4)]
+INSULATION = [0.2, 0.4, 0.7, 0.85]  # oda1..oda4
+
+COMFORT_LOW = 20.0
+COMFORT_HIGH = 24.0
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==========================
+# DIŞ SICAKLIK OKUMA
+# ==========================
+
+def load_outside_temps(csv_path="outside_temperature_year.csv"):
+    df = pd.read_csv(csv_path)
+
+    col = None
+    for c in df.columns:
+        if c.strip().lower() == "tavg":
+            col = c
+            break
+
+    if col is None:
+        # ilk numeric kolonu dene
+        if len(df.columns) >= 2:
+            col = df.columns[1]
+        else:
+            raise ValueError("CSV formatı uygun değil.")
+
+    temps = df[col].dropna().tolist()
+    if len(temps) < 30:
+        raise ValueError("Dış sıcaklık verisi az. outside_temperature_year.csv doğru mu?")
+    return temps
+
+def temp_to_state(temp_c):
+    # 0: soğuk, 1: konfor, 2: sıcak
+    if temp_c < COMFORT_LOW:
+        return 0
+    elif temp_c <= COMFORT_HIGH:
+        return 1
+    else:
+        return 2
+
+# ==========================
+# ORACLE-BASED ACCURACY
+# ==========================
+
+def oracle_targets(activity, inside_temp_c):
+
+    if activity == 0:
+        return 0, 0
+    else:
+        light = 1
+        fan = 1 if inside_temp_c > COMFORT_HIGH else 0
+        return light, fan
+
+def action_to_binary(action):
+    """
+    action -> (light_on, fan_on)
+    fan_on: fan_level > 0 ise 1
+    """
+    mapping = {
+        0: (0, 0),
+        1: (1, 0),
+        2: (0, 1),
+        3: (1, 1),
+        4: (0, 1),
+        5: (1, 1),
+    }
+    return mapping[action]
+
+def evaluate_accuracy_for_room(model, outside_temps, insulation, steps=800):
+    env = FactoryRoomEnv(outside_temps, insulation=insulation)
+    obs = env.reset()
+
+    correct_light = 0
+    correct_fan = 0
+    correct_both = 0
+
+    for _ in range(steps):
+        with torch.no_grad():
+            x = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            q = model(x)
+            action = int(torch.argmax(q, dim=1).item())
+
+        next_obs, reward, done, info = env.step(action)
+
+        target_light, target_fan = oracle_targets(info["activity"], info["inside_temp_c"])
+        pred_light, pred_fan = action_to_binary(action)
+
+        if pred_light == target_light:
+            correct_light += 1
+        if pred_fan == target_fan:
+            correct_fan += 1
+        if (pred_light == target_light) and (pred_fan == target_fan):
+            correct_both += 1
+
+        obs = next_obs
+
+    light_acc = correct_light / steps
+    fan_acc = correct_fan / steps
+    both_acc = correct_both / steps
+    return light_acc, fan_acc, both_acc
+
+# ==========================
+# ENVIRONMENT (tek oda)
+# ==========================
 
 class FactoryRoomEnv:
     """
-    Tek bir oda için pekiştirmeli öğrenme ortamı.
-    Durum:
-        activity: 0-1
-        temp: 0=Soğuk, 1=Konfor, 2=Sıcak
-        hour: 0-1
-        price: 0-1
-    Eylemler: 0..5 ışık/fan kombinasyonları
-
-    hot_room = True ise:
-        Fan çalışmıyorsa ortamın sıcaklığı yukarı doğru tırmanmaya eğilimli.
+    DQN için state'i sayısal bir vektör olarak veriyoruz.
+    İç sıcaklık gerçek °C, dış sıcaklık gerçek °C.
     """
 
-    def __init__(self, hot_room=False):
+    def __init__(self, outside_temps, insulation=0.5):
+        self.outside_temps = outside_temps
+        self.insulation = insulation
         self.n_actions = 6
-        self.state = None
-        self.hot_room = hot_room  
+
+        self.day_index = 0
+        self.activity = 0
+        self.hour = 0
+        self.price = 0
+        self.inside_temp_c = 0.0
 
     def reset(self):
-        self.state = (
-            random.randint(0, 1),  # activity
-            random.randint(0, 2),  # temp
-            random.randint(0, 1),  # hour
-            random.randint(0, 1),  # price
-        )
-        return self.state
+        self.day_index = random.randint(0, len(self.outside_temps) - 1)
+        self.activity = random.randint(0, 1)
+        self.hour = random.randint(0, 1)
+        self.price = 1 if self.hour == 0 else 0  # gündüz pahalı
+        self.inside_temp_c = float(self.outside_temps[self.day_index])
+        return self.get_obs()
+
+    def get_obs(self):
+        outside = float(self.outside_temps[self.day_index])
+
+        # basit normalize: -5..45 arası gibi varsayım
+        def norm_temp(x):
+            return (x + 5.0) / 50.0
+
+        obs = np.array([
+            float(self.activity),
+            norm_temp(self.inside_temp_c),
+            float(self.hour),
+            float(self.price),
+            norm_temp(outside),
+            float(self.insulation),
+        ], dtype=np.float32)
+
+        return obs
 
     def step(self, action):
-        activity, temp, hour, price = self.state
-
-        # Action mapping
+        # action -> (light_on, fan_level)
         mapping = {
-            0: (0, 0),  # kapalı
-            1: (1, 0),  # ışık
-            2: (0, 1),  # fan düşük
-            3: (1, 1),  # ışık + fan düşük
-            4: (0, 2),  # fan yüksek
-            5: (1, 2),  # ışık + fan yüksek
+            0: (0, 0),
+            1: (1, 0),
+            2: (0, 1),
+            3: (1, 1),
+            4: (0, 2),
+            5: (1, 2),
         }
         light_on, fan_level = mapping[action]
 
+        outside_temp_c = float(self.outside_temps[self.day_index])
+
+        # ===== A) sıcaklık güncelle =====
+        base_leak = 0.25
+        leak = base_leak * (1.0 - self.insulation)
+
+        self.inside_temp_c = self.inside_temp_c + leak * (outside_temp_c - self.inside_temp_c)
+
+        if fan_level == 1:
+            self.inside_temp_c -= 0.6
+        elif fan_level == 2:
+            self.inside_temp_c -= 1.2
+
+        if self.inside_temp_c < -10:
+            self.inside_temp_c = -10
+        if self.inside_temp_c > 45:
+            self.inside_temp_c = 45
+
+        temp_state = temp_to_state(self.inside_temp_c)
+
+        # ===== B) ödül =====
         reward = 0.0
 
-        # === ÖDÜL FONKSİYONU ===
-        if activity == 1:
-            if light_on:
-                reward += 3   
-            if temp == 2 and fan_level > 0:
-                reward += 3   
+        if self.activity == 1:
+            if light_on == 1:
+                reward += 3.0
+            if temp_state == 2 and fan_level > 0:
+                reward += 3.0
+            if temp_state == 0 and fan_level > 0:
+                reward -= 1.0
         else:
-            if light_on or fan_level > 0:
-                reward -= 3   
+            if light_on == 1 or fan_level > 0:
+                reward -= 3.0
 
-        # Pahalı saatte gereksiz kapalı kalabilirse bonus
-        if price == 1 and activity == 0 and light_on == 0 and fan_level == 0:
-            reward += 2
+        if self.price == 1 and self.activity == 0 and light_on == 0 and fan_level == 0:
+            reward += 2.0
 
-        # Enerji maliyeti
+        # ===== C) enerji maliyeti =====
         power = 0.0
-        if light_on:
-            power += 1.0
+
+        # gündüz ışık %50, gece %100
+        light_power = 0.5 if self.hour == 0 else 1.0
+        if light_on == 1:
+            power += light_power
+
         if fan_level == 1:
             power += 1.5
         elif fan_level == 2:
             power += 3.0
 
-        cost = power * (1 if price == 0 else 2)  # pahalıysa ×2
-        reward -= cost * 0.4  
+        price_factor = 1.0 if self.price == 0 else 2.0
+        energy_cost = power * price_factor
+        reward -= energy_cost * 0.4
 
-        
-        new_temp = temp
+        # ===== D) zaman ilerlet =====
+        self.day_index = (self.day_index + 1) % len(self.outside_temps)
 
-        # Fan çalışıyorsa soğutma etkisi
-        if fan_level == 1:       # düşük fan
-            if temp == 2:
-                new_temp = 1
-        elif fan_level == 2:     # yüksek fan
-            if temp == 2:
-                new_temp = 1
-            elif temp == 1:
-                new_temp = 0
-
-        # Fan kapalıysa ortamın pasif davranışı
-        if fan_level == 0:
-            if self.hot_room:
-                if new_temp < 2 and random.random() < 0.8:
-                    new_temp += 1
-            else:
-                if hour == 0 and new_temp < 2 and random.random() < 0.4:
-                    new_temp += 1
-                elif hour == 1 and new_temp > 0 and random.random() < 0.4:
-                    new_temp -= 1
         if random.random() < 0.1:
-            hour = 1 - hour
+            self.hour = 1 - self.hour
+        self.price = 1 if self.hour == 0 else 0
 
-        price = 1 if hour == 0 else 0  
-
-        # Aktivite değişimi
         if random.random() < 0.3:
-            activity = 1 - activity
+            self.activity = 1 - self.activity
 
-        self.state = (activity, new_temp, hour, price)
-        info = {"energy_cost": cost}
-        return self.state, reward, False, info
+        next_obs = self.get_obs()
 
+        info = {
+            "energy_cost": energy_cost,
+            "inside_temp_c": self.inside_temp_c,
+            "outside_temp_c": outside_temp_c,
+            "activity": self.activity,   # accuracy için
+            "hour": self.hour,
+        }
 
-def state_to_index(state):
-    a, t, h, p = state
-    return a * 12 + t * 4 + h * 2 + p
+        done = False
+        return next_obs, reward, done, info
 
+# ==========================
+# DQN MODEL
+# ==========================
 
-def train_room(n_episodes=200, max_steps=40, hot_room=False):
-    env = FactoryRoomEnv(hot_room=hot_room)
-    Q = np.zeros((24, 6))
+class DQN(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, out_dim)
+        )
 
-    temp_hist = []
-    cost_hist = []
+    def forward(self, x):
+        return self.net(x)
+
+# ==========================
+# REPLAY BUFFER
+# ==========================
+
+class ReplayBuffer:
+    def __init__(self, capacity=50000):
+        self.capacity = capacity
+        self.buffer = []
+        self.pos = 0
+
+    def push(self, s, a, r, ns):
+        data = (s, a, r, ns)
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(data)
+        else:
+            self.buffer[self.pos] = data
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size=64):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, ns = zip(*batch)
+        return np.array(s), np.array(a), np.array(r), np.array(ns)
+
+    def __len__(self):
+        return len(self.buffer)
+
+# ==========================
+# DQN TRAIN
+# ==========================
+
+def choose_action(model, obs, epsilon, n_actions):
+    if random.random() < epsilon:
+        return random.randint(0, n_actions - 1)
+    with torch.no_grad():
+        x = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        q = model(x)
+        return int(torch.argmax(q, dim=1).item())
+
+def train_dqn_for_room(outside_temps, insulation,
+                       n_episodes=400,
+                       max_steps=60,
+                       batch_size=64,
+                       gamma=0.99,
+                       lr=1e-3,
+                       target_update=200):
+
+    env = FactoryRoomEnv(outside_temps, insulation=insulation)
+
+    obs_dim = 6
+    n_actions = env.n_actions
+
+    policy_net = DQN(obs_dim, n_actions).to(DEVICE)
+    target_net = DQN(obs_dim, n_actions).to(DEVICE)
+    target_net.load_state_dict(policy_net.state_dict())
+
+    optimizer = optim.Adam(policy_net.parameters(), lr=lr)
+    buffer = ReplayBuffer(capacity=30000)
+
+    step_count = 0
+
+    last_temp = []
+    last_cost = []
 
     for ep in range(n_episodes):
-        s = env.reset()
-        epsilon = 1 - ep / n_episodes  # lineer azalan
+        obs = env.reset()
+        epsilon = max(0.05, 1.0 - ep / n_episodes)
 
-        for step in range(max_steps):
-            if random.random() < epsilon:
-                a = random.randint(0, 5)
-            else:
-                a = int(np.argmax(Q[state_to_index(s)]))
+        for t in range(max_steps):
+            action = choose_action(policy_net, obs, epsilon, n_actions)
+            next_obs, reward, done, info = env.step(action)
 
-            ns, r, _, info = env.step(a)
+            buffer.push(obs, action, reward, next_obs)
+            obs = next_obs
 
-            idx_s = state_to_index(s)
-            idx_ns = state_to_index(ns)
+            step_count += 1
 
-            Q[idx_s, a] += 0.1 * (r + 0.95 * np.max(Q[idx_ns]) - Q[idx_s, a])
+            if len(buffer) >= batch_size:
+                s, a, r, ns = buffer.sample(batch_size)
 
-            # Son epizot için log alıyoruz
+                s_t = torch.tensor(s, dtype=torch.float32).to(DEVICE)
+                a_t = torch.tensor(a, dtype=torch.int64).unsqueeze(1).to(DEVICE)
+                r_t = torch.tensor(r, dtype=torch.float32).unsqueeze(1).to(DEVICE)
+                ns_t = torch.tensor(ns, dtype=torch.float32).to(DEVICE)
+
+                q_sa = policy_net(s_t).gather(1, a_t)
+
+                with torch.no_grad():
+                    max_next_q = target_net(ns_t).max(1, keepdim=True)[0]
+                    target = r_t + gamma * max_next_q
+
+                loss = ((q_sa - target) ** 2).mean()
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            if step_count % target_update == 0:
+                target_net.load_state_dict(policy_net.state_dict())
+
             if ep == n_episodes - 1:
-                temp_hist.append(ns[1])
-                cost_hist.append(info["energy_cost"])
+                last_temp.append(info["inside_temp_c"])
+                last_cost.append(info["energy_cost"])
 
-            s = ns
+        if (ep + 1) % max(1, n_episodes // 5) == 0:
+            print(f"Episode {ep+1}/{n_episodes}, epsilon={epsilon:.2f}")
 
-    return Q, temp_hist, cost_hist
+    return policy_net, last_temp, last_cost
+
+# ==========================
+# GÖRSELLEŞTİRME
+# ==========================
 
 def action_to_color(action):
-    mapping = {
-        0: 0,  # kapalı
-        1: 1,  # ışık
-        2: 2,  # fan
-        3: 3,  # ışık+fan
-        4: 2,  # fan yüksek
-        5: 3,  # ışık+fan yüksek
-    }
+    mapping = {0: 0, 1: 1, 2: 2, 3: 3, 4: 2, 5: 3}
     return mapping[action]
 
+cmap = ListedColormap(["#555555", "#FFD700", "#000080", "#1E90FF"])
 
-cmap = ListedColormap([
-    "#555555",  # 0 gri
-    "#FFD700",  # 1 sarı
-    "#000080",  # 2 lacivert
-    "#1E90FF",  # 3 mavi
-])
-
-def create_factory_gif(Q_rooms, hot_flags, filename="factory.gif", frames=50):
-    # Her oda için kendi ortamını başlat (aynı hot_room parametresi ile)
-    envs = [FactoryRoomEnv(hot_room=hot_flags[i]) for i in range(4)]
-    for e in envs:
+def create_factory_gif(models, outside_temps, filename="factory.gif", frames=60):
+    envs = []
+    for i in range(4):
+        e = FactoryRoomEnv(outside_temps, insulation=INSULATION[i])
         e.reset()
+        envs.append(e)
 
     imgs = []
 
     for t in range(frames):
         grid = np.zeros((6, 6), dtype=int)
 
-        # 4 odanın her biri için greedy aksiyon seç
         for i, (r, c) in enumerate(ROOM_POSITIONS):
-            state = envs[i].state
-            a = int(np.argmax(Q_rooms[i][state_to_index(state)]))
+            obs = envs[i].get_obs()
+            with torch.no_grad():
+                x = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                q = models[i](x)
+                a = int(torch.argmax(q, dim=1).item())
+
             grid[r, c] = action_to_color(a)
             envs[i].step(a)
 
-        # Çizim
         fig, ax = plt.subplots(figsize=(5, 5))
         ax.imshow(grid, cmap=cmap, vmin=0, vmax=3)
         ax.set_xticks(range(6))
         ax.set_yticks(range(6))
-        ax.set_title("Fabrika - 4 Odalı Kontrol")
+        ax.set_title("Fabrika - 4 Oda Işık/Fan Durumu (DQN)")
         plt.tight_layout()
 
         fig.canvas.draw()
         img = np.asarray(fig.canvas.buffer_rgba())
         imgs.append(img)
-        plt.close()
+        plt.close(fig)
 
     imageio.mimsave(filename, imgs, fps=4)
     print("GIF kaydedildi:", filename)
 
-def save_graphs(temp, cost,
+def save_graphs(temp_c_list, cost_list,
                 temp_file="temperature.png",
                 energy_file="energy.png"):
-    plt.figure()
-    plt.plot(temp, marker="o")
-    plt.yticks([0, 1, 2], ["Soğuk", "Konfor", "Sıcak"])
-    plt.title("Sıcaklık (Son episode)")
+
+    steps = range(len(temp_c_list))
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(steps, temp_c_list, marker="o")
+    plt.axhline(COMFORT_LOW, linestyle="--")
+    plt.axhline(COMFORT_HIGH, linestyle="--")
+    plt.title("İç Sıcaklık (Son Epizot) - °C")
     plt.xlabel("Adım")
-    plt.ylabel("Sıcaklık durumu")
+    plt.ylabel("İç Sıcaklık (°C)")
     plt.tight_layout()
     plt.savefig(temp_file, dpi=150)
     plt.close()
+    print("Kaydedildi:", temp_file)
 
-    plt.figure()
-    plt.plot(cost, marker="o")
-    plt.title("Enerji Maliyeti (Son episode)")
+    plt.figure(figsize=(7, 4))
+    plt.plot(steps, cost_list, marker="o")
+    plt.title("Enerji Maliyeti (Son Epizot)")
     plt.xlabel("Adım")
     plt.ylabel("Enerji maliyeti (göreli)")
     plt.tight_layout()
     plt.savefig(energy_file, dpi=150)
     plt.close()
+    print("Kaydedildi:", energy_file)
 
-    print(f"PNG dosyaları kaydedildi: {temp_file}, {energy_file}")
+# ==========================
+# MAIN
+# ==========================
 
 if __name__ == "__main__":
-    Q_rooms = []
+    outside_temps = load_outside_temps("outside_temperature_year.csv")
+
+    models = []
     temp_last = []
     cost_last = []
 
-    # 4 odayı sırayla eğit: ilk iki oda "hot_room=True"
     for i in range(4):
-        hot = HOT_ROOM_FLAGS[i]
-        print(f"Oda {i+1} eğitiliyor... (hot_room={hot})")
-        Q, temp, cost = train_room(
-            n_episodes=1500,   
-            max_steps=40,
-            hot_room=hot
+        print(f"\nOda {i+1} DQN eğitiliyor... (insulation={INSULATION[i]})")
+        model, last_temp, last_cost = train_dqn_for_room(
+            outside_temps,
+            insulation=INSULATION[i],
+            n_episodes=400,
+            max_steps=60,
+            batch_size=64,
+            gamma=0.99,
+            lr=1e-3,
+            target_update=200
         )
-        Q_rooms.append(Q)
-        temp_last = temp
-        cost_last = cost
+        models.append(model)
+        temp_last = last_temp
+        cost_last = last_cost
 
-    create_factory_gif(Q_rooms, HOT_ROOM_FLAGS, filename="factory.gif", frames=60)
-    save_graphs(temp_last, cost_last)
+    # çıktılar
+    create_factory_gif(models, outside_temps, filename="factory.gif", frames=60)
+    save_graphs(temp_last, cost_last, temp_file="temperature.png", energy_file="energy.png")
+
+    # accuracy (oracle-based)
+    print("\n=== ORACLE-BASED ACCURACY ===")
+    for i in range(4):
+        la, fa, ba = evaluate_accuracy_for_room(models[i], outside_temps, INSULATION[i], steps=800)
+        print(f"Oda {i+1}: Light Acc={la:.2f}  Fan Acc={fa:.2f}  Overall Acc={ba:.2f}")
